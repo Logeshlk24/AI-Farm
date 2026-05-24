@@ -95,33 +95,79 @@ function detectClimate(lat) {
 // ─────────────────────────────────────────────────────────────
 //  DATA FETCHERS
 // ─────────────────────────────────────────────────────────────
+
+// Fetch with timeout helper
+function fetchWithTimeout(url, ms = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
+// Aggregate Open-Meteo daily response into { year: [12 monthly totals] }
+function aggregateDaily(data, result) {
+  (data.daily?.time || []).forEach((d, i) => {
+    const dt = new Date(d), yr = dt.getFullYear(), mo = dt.getMonth();
+    if (result[yr]) result[yr][mo] += (data.daily.precipitation_sum[i] || 0);
+  });
+}
+
 async function fetchAllRainfall(lat, lon) {
   const result = {};
   RAIN_YEARS.forEach(y => { result[y] = Array(12).fill(0); });
 
-  // ERA5 archive: 2020 → 2025
-  const archRes  = await fetch(`https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=2020-01-01&end_date=2025-12-31&daily=precipitation_sum&timezone=auto`);
-  const archData = await archRes.json();
-  (archData.daily?.time || []).forEach((d, i) => {
-    const dt = new Date(d), yr = dt.getFullYear(), mo = dt.getMonth();
-    if (result[yr]) result[yr][mo] += (archData.daily.precipitation_sum[i] || 0);
-  });
+  const thisYear = TODAY.getFullYear();
+  // ERA5 archive end: last day of previous year (archive lags ~5 days so use year boundary)
+  const archiveEnd = `${thisYear - 1}-12-31`;
 
-  // 2026 YTD via forecast past_days
-  const daysSinceJan1 = Math.floor((TODAY - new Date(TODAY.getFullYear()+"-01-01")) / 86400000) + 1;
-  const fRes  = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=precipitation_sum&timezone=auto&past_days=${daysSinceJan1}&forecast_days=1`);
-  const fData = await fRes.json();
-  (fData.daily?.time || []).forEach((d, i) => {
-    const dt = new Date(d), yr = dt.getFullYear(), mo = dt.getMonth();
-    if (yr === TODAY.getFullYear() && result[yr]) result[yr][mo] += (fData.daily.precipitation_sum[i] || 0);
-  });
+  // 2026 YTD: use archive endpoint with explicit date range — avoids past_days limit (max 92)
+  const todayStr = TODAY.toISOString().split("T")[0];
+  const ytdStart = `${thisYear}-01-01`;
 
+  // Run both fetches in parallel
+  const [archRes, ytdRes] = await Promise.allSettled([
+    fetchWithTimeout(
+      `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=2020-01-01&end_date=${archiveEnd}&daily=precipitation_sum&timezone=auto`
+    ),
+    fetchWithTimeout(
+      `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${ytdStart}&end_date=${todayStr}&daily=precipitation_sum&timezone=auto`
+    ),
+  ]);
+
+  // Process historical 2020 → (thisYear-1)
+  if (archRes.status === "fulfilled" && archRes.value.ok) {
+    try {
+      const archData = await archRes.value.json();
+      aggregateDaily(archData, result);
+    } catch(e) { console.warn("Archive parse error", e); }
+  } else {
+    console.warn("ERA5 archive fetch failed:", archRes.reason || archRes.value?.status);
+  }
+
+  // Process current year YTD
+  if (ytdRes.status === "fulfilled" && ytdRes.value.ok) {
+    try {
+      const ytdData = await ytdRes.value.json();
+      aggregateDaily(ytdData, result);
+    } catch(e) { console.warn("YTD parse error", e); }
+  } else {
+    console.warn("YTD fetch failed:", ytdRes.reason || ytdRes.value?.status);
+  }
+
+  // Round all values
   RAIN_YEARS.forEach(y => { result[y] = result[y].map(v => Math.round(v * 10) / 10); });
+
+  // Validate — if everything is zero something went wrong
+  const totalData = RAIN_YEARS.reduce((s,y) => s + result[y].reduce((a,b)=>a+b,0), 0);
+  if (totalData === 0) throw new Error("No rainfall data returned from API");
+
   return result;
 }
 
 async function fetchWeather(lat, lon) {
-  const res = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode&timezone=auto&forecast_days=7`);
+  const res = await fetchWithTimeout(
+    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode&timezone=auto&forecast_days=7`
+  );
   return res.json();
 }
 
@@ -442,9 +488,19 @@ export default function App() {
   }
 
   async function loadRainfall(lat, lon) {
-    setRainLoad(true); setRainErr("");
-    try { setRainData(await fetchAllRainfall(lat, lon)); }
-    catch(e) { setRainErr("Could not fetch rainfall data. Check connection."); }
+    const loc = lat || userLoc?.lat;
+    const lng = lon || userLoc?.lon;
+    if (!loc || !lng) return;
+    setRainLoad(true); setRainErr(""); setRainData(null);
+    try {
+      const data = await fetchAllRainfall(loc, lng);
+      setRainData(data);
+    } catch(e) {
+      const msg = e.name === "AbortError"
+        ? "Request timed out. Open-Meteo may be slow — tap Retry."
+        : ("Failed to load: " + e.message);
+      setRainErr(msg);
+    }
     setRainLoad(false);
   }
 
@@ -487,18 +543,29 @@ export default function App() {
   }
 
   // ── AI ──
+  // Calls /api/ask — a Vercel serverless function.
+  // Your ANTHROPIC_API_KEY lives only in Vercel env vars, never in browser code.
   async function askAI() {
     if (!aiQ.trim() || aiLoad) return;
     setAiLoad(true); setAiResp("");
-    const ctx = `You are FarmWise AI — a precise Indian agricultural advisor. Farm: "${activeLand?.name||"Farm"}", Area=${activeLand?.area||"?"}m² (${activeLand?.acres?.toFixed(2)||"?"}ac), GPS=(${userLoc?.lat?.toFixed(4)},${userLoc?.lon?.toFixed(4)}), Soil=${soil?.name||"?"}, pH=${soil?.ph||"?"}, Climate=${userLoc ? detectClimate(userLoc.lat) : "?"}. Give 4–5 sentences of precise actionable advice with specific quantities.`;
+
+    const system = `You are FarmWise AI — a precise Indian agricultural advisor. Farm: "${activeLand?.name||"Farm"}", Area=${activeLand?.area||"?"}m² (${activeLand?.acres?.toFixed(2)||"?"}ac), GPS=(${userLoc?.lat?.toFixed(4)},${userLoc?.lon?.toFixed(4)}), Soil=${soil?.name||"?"}, pH=${soil?.ph||"?"}, Climate=${userLoc ? detectClimate(userLoc.lat) : "?"}. Give 4–5 sentences of precise actionable advice with specific quantities.`;
+
     try {
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:1000, system:ctx, messages:[{ role:"user", content:aiQ }] })
+      const r = await fetch("/api/ask", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ system, question: aiQ }),
       });
       const d = await r.json();
-      setAiResp(d.content?.[0]?.text || "No response.");
-    } catch(e) { setAiResp("⚠️ Connection error. Try again."); }
+      if (!r.ok) {
+        setAiResp(`⚠️ ${d.error || "Server error."}`);
+      } else {
+        setAiResp(d.text || "No response.");
+      }
+    } catch(e) {
+      setAiResp("⚠️ Network error. Make sure the app is deployed on Vercel.");
+    }
     setAiLoad(false);
   }
 
@@ -876,8 +943,23 @@ export default function App() {
               </div>
             )}
 
-            {rainLoad && <div style={S.card}><div style={S.body}><div style={{ color:T.muted, fontSize:13, textAlign:"center", padding:"24px 0" }}>🌧 Fetching ERA5 + live {TODAY.getFullYear()} rainfall data from Open-Meteo…</div></div></div>}
-            {rainErr  && <div style={S.card}><div style={S.body}><div style={{ color:T.red, fontSize:13 }}>⚠️ {rainErr}</div></div></div>}
+            {rainLoad && (
+              <div style={S.card}><div style={S.body}>
+                <div style={{ color:T.muted, fontSize:13, textAlign:"center", padding:"20px 0" }}>
+                  <div style={{ fontSize:28, marginBottom:8 }}>🌧</div>
+                  <div>Fetching ERA5 rainfall data from Open-Meteo…</div>
+                  <div style={{ fontSize:11, marginTop:6, color:"rgba(255,255,255,0.25)" }}>Fetching 2020–{TODAY.getFullYear()} · usually takes 5–10 seconds</div>
+                </div>
+              </div></div>
+            )}
+            {rainErr && (
+              <div style={S.card}><div style={S.body}>
+                <div style={{ color:T.red, fontSize:13, marginBottom:12 }}>⚠️ {rainErr}</div>
+                <button style={S.btn(T.green,"sm")} onClick={()=>loadRainfall(userLoc.lat, userLoc.lon)}>
+                  🔄 Retry
+                </button>
+              </div></div>
+            )}
 
             {rainData && (
               <>
